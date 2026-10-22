@@ -6,7 +6,29 @@ const { spawn } = require('child_process')
 const Store = require('electron-store')
 const { autoUpdater } = require('electron-updater')
 const log = require('electron-log')
+
+// 更名后继续使用旧数据目录，保留已有项目、素材和中转站配置。
+app.setPath('userData', path.join(app.getPath('appData'), app.isPackaged ? 'AI Video Canvas' : 'ai-video-canvas'))
+app.setName('芜湖AI')
+
+// 画布中的视频缩略图按用户要求带声音预览。Chromium 默认要求手势才可
+// 播放有声媒体，桌面应用在创建窗口前关闭该限制；浏览器版仍保留点击重试。
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
+
 const jianying = require('./jianyingDraft.cjs')
+require('./unmau.cjs')({ ipcMain, net, app })
+require('./yu25.cjs')({ ipcMain, net, app })
+require('./fmgo.cjs')({ ipcMain, net, app })
+require('./xinshuju.cjs')({ ipcMain, net, app })
+require('./qiling.cjs')({ ipcMain, net, app })
+const saveGeneratedVideo = require('./videoStorage.cjs').createVideoSaver({
+  root: path.join(app.getPath('userData'), 'generated-videos', 'automatic'),
+  fetch: (...args) => net.fetch(...args),
+})
+ipcMain.handle('video:save-generated', async (_event, payload) => {
+  try { return { ok: true, ...(await saveGeneratedVideo(payload)) } }
+  catch (error) { return { ok: false, error: error.message || '成片保存失败' } }
+})
 
 const store = new Store({ name: 'ai-video-canvas-config' })
 
@@ -399,6 +421,7 @@ ipcMain.handle('jianying:export-draft', async (_event, clips, draftName) => {
 
 function createWindow() {
   mainWindow = new BrowserWindow({
+    title: '芜湖AI',
     width: 1400,
     height: 900,
     minWidth: 1200,

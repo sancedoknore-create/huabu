@@ -28,6 +28,42 @@ import { urlToBase64, compressImageToDataUrl } from '../imageProviderUtils'
 const DEFAULT_BASE_URL = 'https://api.aiid.edu.kg'
 const DEFAULT_MODEL = 'grok-imagine-video-1.5-preview'
 
+/** 器灵当前 Seedance 2.5 满血线路使用 /v1/videos 的标准字段。 */
+export function isQilingSeedance25Model(model: string): boolean {
+  return /^SD2\.5-/i.test(model)
+}
+
+function isQilingFixedDurationModel(model: string): boolean {
+  return /(?:CB-720P|JL-720P)$/i.test(model)
+}
+
+function isQilingHnModel(model: string): boolean {
+  return /HN-720P$/i.test(model)
+}
+
+export function isQilingCbModel(model: string): boolean {
+  return /CB-720P(?:-备用)?$/i.test(model)
+}
+
+/** CB 480P 是新的多媒体参考线路，不能套用 CB 720P 的图片-only 限制。 */
+export function isQilingCb480Model(model: string): boolean {
+  return /CB-480P$/i.test(model)
+}
+
+/** CB 满参线路支持三类参考素材，参数与普通 CB-720P 不同。 */
+export function isQilingCbFullModel(model: string): boolean {
+  return /CB-720P-满参$/i.test(model)
+}
+
+/** GF 线路使用带版本头的 v1 协议，字段与 CB/XG 线路不同。 */
+export function isQilingGfModel(model: string): boolean {
+  return /^SD2\.5-满血-GF-(?:480P|720P)$/i.test(model)
+}
+
+function isQilingCbBackupModel(model: string): boolean {
+  return /CB-720P-备用$/i.test(model)
+}
+
 /**
  * 把 ratio 字符串归一成出海营接受的 aspect_ratio 字段（保持原样，因为它接受 '16:9' / '9:16' 等）
  * 'auto' 不传，让网关默认。
@@ -65,13 +101,16 @@ function ratioToSize(ratio: string, resolution?: string): string {
  * 把 /v1/videos/{id} 返回归一成内部 TaskStatus 形状。
  * 出海营状态枚举：queued / in_progress / completed / failed。
  */
-export function mapVideoTaskResponse(raw: any): TaskStatus {
+export function mapVideoTaskResponse(raw: any, inspectReferenceErrors = false): TaskStatus {
   // Qiling 返回格式：{ status: "QUEUED", data: { status: "queued", progress: 0, metadata: { url: "" } } }
   const dataObj = raw?.data || raw
   // Qiling 顶层 status 和 data.status 可能不一致，优先取顶层（完成时是 "success"）
   const topStatus = (raw?.status || '').toLowerCase()
   const innerStatus = (dataObj?.status || '').toLowerCase()
-  const rawStatus: string = (topStatus === 'success' ? topStatus : innerStatus || topStatus || 'queued')
+  const failedStatuses = ['failed', 'failure', 'error', 'cancelled', 'canceled', 'timeout']
+  const rawStatus: string = failedStatuses.includes(innerStatus) ? innerStatus
+    : failedStatuses.includes(topStatus) ? topStatus
+    : (topStatus === 'success' ? topStatus : innerStatus || topStatus || 'queued')
   const statusMap: Record<string, TaskStatus['status']> = {
     queued: 'pending',
     in_progress: 'processing',
@@ -130,12 +169,22 @@ export function mapVideoTaskResponse(raw: any): TaskStatus {
     detail?.pending_info?.failure_reason
     || detail?.failure_reason
     || raw?.error?.message
+    || dataObj?.error?.message
+    || (typeof dataObj?.error === 'string' ? dataObj.error : undefined)
+    || raw?.fail_reason
     || raw?.message
     || (typeof raw?.error === 'string' ? raw.error : undefined)
     || undefined
 
   console.log('[mapVideoTask] rawStatus=', rawStatus, 'videoUrl=', videoUrl, 'raw keys=', Object.keys(raw||{}).join(','), 'data keys=', Object.keys(dataObj||{}).join(','))
-  return { status, progress, videoUrl, error: errorMsg }
+  const referenceErrors = inspectReferenceErrors
+    ? [dataObj?.input, ...(Array.isArray(dataObj?.images) ? dataObj.images : [])]
+      .filter((value): value is string => typeof value === 'string' && /生成失败|素材.*(?:失败|错误)|引用.*(?:失败|错误)|failed to (?:load|fetch)/i.test(value))
+    : []
+  const warning = referenceErrors.length
+    ? `器灵回显的参考素材含错误信息，无法确认素材是否被正常使用，请检查视频结果。${[...new Set(referenceErrors)].join('；')}`
+    : undefined
+  return { status, progress, videoUrl, error: errorMsg, ...(warning ? { warning } : {}) }
 }
 
 export class ChuhaiyingVideoProvider implements AIProvider {
@@ -177,11 +226,14 @@ export class ChuhaiyingVideoProvider implements AIProvider {
     const model = params.model || DEFAULT_MODEL
     const isOmniOrVeo = model.startsWith('gemini-omni') || model.startsWith('veo')
     const isSd2 = model.startsWith('sd2-')
+    const isQilingSeedance25 = isQilingSeedance25Model(model)
     const isEdit = params.mode === 'edit'
 
     // 从 content / 各字段里提取图片和视频 URL
     let editVideoUrl: string | undefined
     const refs: string[] = []
+    const videoRefs: string[] = []
+    const audioRefs: string[] = []
     if (params.image_url) refs.push(params.image_url)
     if (params.image_urls?.length) refs.push(...params.image_urls)
     if (params.content?.length) {
@@ -191,19 +243,121 @@ export class ChuhaiyingVideoProvider implements AIProvider {
           if (u) refs.push(u)
         } else if (item.type === 'video_url') {
           const u = typeof item.video_url === 'string' ? item.video_url : item.video_url?.url
-          if (u) editVideoUrl = u
+          if (u) {
+            editVideoUrl = u
+            videoRefs.push(u)
+          }
+        } else if (item.type === 'audio_url') {
+          const u = typeof item.audio_url === 'string' ? item.audio_url : item.audio_url?.url
+          if (u) audioRefs.push(u)
         }
       }
     }
     // image_url / image_urls / content 三处来源叠加可能重复，统一去重
     refs.splice(0, refs.length, ...new Set(refs))
+    videoRefs.splice(0, videoRefs.length, ...new Set(videoRefs))
+    audioRefs.splice(0, audioRefs.length, ...new Set(audioRefs))
 
     const body: Record<string, any> = {
       model,
       prompt: params.prompt,
     }
 
-    if (isSd2) {
+    if (isQilingSeedance25) {
+      const isGf = isQilingGfModel(model)
+      if (isGf) {
+        const requestedRatio = params.ratio && params.ratio !== 'auto' ? params.ratio : '16:9'
+        if (!['16:9', '4:3', '1:1', '3:4', '9:16', 'adaptive'].includes(requestedRatio)) {
+          throw new Error('器灵 GF 线路只支持 16:9、4:3、1:1、3:4、9:16、adaptive 画幅')
+        }
+        const requested = Number(params.duration)
+        body.seconds = Number.isInteger(requested) && requested >= 4 && requested <= 30 ? requested : 5
+        body.resolution = model.endsWith('480P') ? '480p' : '720p'
+        body.aspect_ratio = requestedRatio
+        if (videoRefs.length || audioRefs.length || params.mode === 'reference_material' || params.mode === 'r2v') {
+          body.mode = '参考生视频'
+        } else if (params.mode === 'i2v') {
+          body.mode = refs.length === 2 ? '首尾帧' : '首帧生视频'
+        } else if (refs.length === 1) {
+          body.mode = '首帧生视频'
+        } else if (refs.length === 2) {
+          body.mode = '首尾帧'
+        } else {
+          body.mode = '文生视频'
+        }
+        if (refs.length > 10) throw new Error(`${model} 最多支持 10 张参考图片`)
+        if (videoRefs.length > 5) throw new Error(`${model} 最多支持 5 个参考视频`)
+        if (audioRefs.length > 5) throw new Error(`${model} 最多支持 5 个参考音频`)
+        if (refs.length) body.images = refs
+        if (videoRefs.length) body.videos = videoRefs
+        if (audioRefs.length) body.audios = audioRefs
+      } else {
+      // 器灵 SD2.5 满血线路使用标准数组字段，不发送旧版 metadata；分辨率由模型线路决定。
+      const requestedRatio = normalizeRatio(params.ratio)
+      const aspectRatio = requestedRatio && requestedRatio !== 'adaptive' ? requestedRatio : '16:9'
+      const isCbBackup = isQilingCbBackupModel(model)
+      const isImageOnly = isQilingCbModel(model) || isQilingHnModel(model)
+      const isCb480 = isQilingCb480Model(model)
+      const isCbFull = isQilingCbFullModel(model)
+      if (isCb480 && !['16:9', '9:16'].includes(aspectRatio)) {
+        throw new Error('器灵 CB 480P 线路只支持 16:9、9:16 画幅')
+      }
+      if (isCbFull && !['16:9', '9:16', '1:1'].includes(aspectRatio)) {
+        throw new Error('器灵 CB 满参线路只支持 16:9、9:16、1:1 画幅')
+      }
+      if (isCbBackup && !['16:9', '9:16', '1:1'].includes(aspectRatio)) {
+        throw new Error('器灵 CB 备用线路只支持 16:9、9:16、1:1 画幅')
+      }
+      body.aspect_ratio = aspectRatio
+
+      if (isCbBackup) {
+        const requested = Number(params.duration)
+        body.duration = [5, 10, 15, 30].includes(requested) ? requested : 30
+      } else if (isCbFull) {
+        const requested = Number(params.duration)
+        body.duration = Number.isInteger(requested) && requested >= 5 && requested <= 30 ? requested : 30
+      } else if (isQilingHnModel(model)) {
+        const allowedDurations = [5, 10, 20, 30]
+        const requested = Number(params.duration)
+        body.seconds = String(allowedDurations.includes(requested) ? requested : 30)
+      } else if (isQilingFixedDurationModel(model)) {
+        body.duration = 30
+      } else {
+        const requested = Number(params.duration)
+        body.duration = Number.isFinite(requested) && requested > 0
+          ? Math.max(4, Math.min(30, Math.round(requested)))
+          : 5
+      }
+
+      if (refs.length) body.images = refs
+      if (isCb480) {
+        if (refs.length > 30) throw new Error(`${model} 最多支持 30 张参考图片`)
+        if (videoRefs.length > 10) throw new Error(`${model} 最多支持 10 个参考视频`)
+        if (audioRefs.length > 10) throw new Error(`${model} 最多支持 10 个参考音频`)
+        const totalReferences = refs.length + videoRefs.length + audioRefs.length
+        if (totalReferences > 50) throw new Error(`${model} 的参考素材合计最多 50 项`)
+      }
+      if (isCbFull) {
+        if (refs.length > 30) throw new Error(`${model} 最多支持 30 张参考图片`)
+        if (videoRefs.length > 10) throw new Error(`${model} 最多支持 10 个参考视频`)
+        if (audioRefs.length > 10) throw new Error(`${model} 最多支持 10 个参考音频`)
+        const totalReferences = refs.length + videoRefs.length + audioRefs.length
+        if (totalReferences > 50) throw new Error(`${model} 的参考素材合计最多 50 项`)
+      }
+      if (isImageOnly) {
+        const maxImages = isQilingHnModel(model) ? 30 : 9
+        if (refs.length > maxImages) throw new Error(`${model} 最多支持 ${maxImages} 张参考图片`)
+        if (videoRefs.length || audioRefs.length) throw new Error(`${model} 按器灵插件协议使用图片参考，多媒体参考请使用 XG 线路`)
+        if (refs.some(url => !/^https:\/\//i.test(url))) throw new Error(`${model} 参考图片必须是公网 HTTPS 地址`)
+        if (!isQilingHnModel(model) && Array.from(params.prompt).length > 12000) throw new Error('器灵 CB 线路提示词不能超过 12000 个字符')
+      }
+      if (videoRefs.length) body.videos = videoRefs
+      if (audioRefs.length) body.audios = audioRefs
+      if (!isImageOnly && params.generate_audio !== undefined) {
+        body.generate_audio = !!params.generate_audio
+      }
+      }
+    } else if (isSd2) {
       // Qiling sd2 专用格式：metadata 嵌套 + base64 参考图
       // modeType 取值必须与器灵后端一致（无连字符）：
       //   text2video（无参考图）/ image2video（单图）/ mixed2video（多图参考）
@@ -271,14 +425,22 @@ export class ChuhaiyingVideoProvider implements AIProvider {
       }
     }
 
-    const data = await this.request<{ id?: string; request_id?: string; task_id?: string }>('/v1/videos', {
+    const data = await this.request<any>('/v1/videos', {
       method: 'POST',
       body: JSON.stringify(body),
     })
     // 器灵返回任务 ID 的字段不固定：id / request_id / task_id 都可能（与参考插件一致）
-    const taskId = data?.id || data?.request_id || data?.task_id
+    const taskId = data?.id
+      || data?.request_id
+      || data?.task_id
+      || data?.data?.id
+      || data?.data?.request_id
+      || data?.data?.task_id
+      || data?.data?.task?.id
+      || data?.result?.id
+      || data?.result?.task_id
     if (!taskId) throw new Error('创建视频任务失败：未返回任务 ID（id/request_id/task_id）')
-    return { taskId }
+    return { taskId: String(taskId) }
   }
 
   async getTaskStatus(taskId: string): Promise<TaskStatus> {
@@ -286,7 +448,19 @@ export class ChuhaiyingVideoProvider implements AIProvider {
       `/v1/videos/${encodeURIComponent(taskId)}`,
       { method: 'GET' }
     )
-    return mapVideoTaskResponse(data)
+    return mapVideoTaskResponse(data, /(?:^|\.)qilingze\.com$/i.test(new URL(this.baseUrl).hostname))
+  }
+
+  async download(taskId: string, videoUrl?: string): Promise<string> {
+    const bridge = window.electronAPI?.qiling
+    if (!bridge) throw new Error('器灵本地下载组件未加载，请完全退出并重新打开软件')
+    const result = await bridge.download({ apiKey: this.apiKey, taskId, videoUrl })
+    if (!result?.ok || !result.data?.path) {
+      const error = new Error(result?.error || '器灵视频下载失败') as Error & { retryable?: boolean }
+      error.retryable = !!result?.retryable
+      throw error
+    }
+    return `local-upload:///${result.data.path.replace(/\\/g, '/')}`
   }
 
   async textToVideo(params: TextToVideoParams): Promise<VideoResult> {
@@ -337,6 +511,7 @@ export class ChuhaiyingVideoProvider implements AIProvider {
         headers: {
           'Authorization': `Bearer ${this.apiKey}`,
           'Content-Type': 'application/json',
+          ...(this.baseUrl.toLowerCase().includes('qilingze.com') ? { 'X-Qiling-API-Version': '1' } : {}),
           ...(init.headers || {}),
         },
       })

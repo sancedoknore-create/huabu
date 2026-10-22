@@ -1,5 +1,11 @@
 <template>
-  <div class="node-editor" @contextmenu="handleContextMenu">
+  <div
+    ref="canvasRef"
+    class="node-editor"
+    @contextmenu="handleContextMenu"
+    @dragover.prevent="onCanvasDragOver"
+    @drop.prevent="onCanvasDrop"
+  >
     <VueFlow
       v-model:nodes="nodes"
       v-model:edges="edges"
@@ -8,30 +14,54 @@
       :max-zoom="4"
       :snap-to-grid="true"
       :snap-grid="[15, 15]"
+      :nodes-draggable="true"
+      :elements-selectable="true"
       :is-valid-connection="isValidConnection"
       :default-edge-options="{ type: 'animated' }"
-      :selection-key="'Shift'"
-      :multi-selection-key="'Shift'"
+      :selection-key-code="ctrlPressed || selectionMode"
+      :multi-selection-key-code="'Control'"
+      :pan-on-drag="ctrlPressed || selectionMode ? [1, 2] : true"
       @pane-context-menu="onPaneContextMenu"
       @node-context-menu="onNodeContextMenu"
       @node-click="onNodeClick"
+      @pane-click="nodeStore.selectNode(null)"
       @node-drag="onNodeDrag"
       @node-drag-stop="onNodeDragStop"
       class="vue-flow-container"
+      :class="{ 'edges-hidden': !showEdges }"
     >
-      <Background pattern-color="#00D9FF" :gap="20" :size="1" />
-      <Controls />
-      <MiniMap :pannable="true" :zoomable="true" />
+      <template #connection-line="connectionLineProps">
+        <ConnectionPreview v-bind="connectionLineProps" />
+      </template>
+      <Background pattern-color="#333943" :gap="24" :size="1" />
+      <MiniMap v-if="showMiniMap" position="bottom-left" :pannable="true" :zoomable="true" mask-color="rgba(0, 0, 0, 0.35)" node-color="#626975" />
     </VueFlow>
+
+    <CanvasToolbar
+      :zoom="viewport.zoom"
+      :selection-mode="selectionMode"
+      :show-mini-map="showMiniMap"
+      :show-edges="showEdges"
+      :nodes="nodes"
+      @create="addFromToolbar"
+      @upload="uploadFromToolbar"
+      @navigate="router.push($event)"
+      @toggle-selection="selectionMode = !selectionMode"
+      @toggle-mini-map="showMiniMap = !showMiniMap"
+      @toggle-edges="showEdges = !showEdges"
+      @zoom="zoomTo($event, { duration: 180 })"
+      @fit="fitCanvas"
+      @focus-node="focusCanvasNode"
+    />
 
     <!-- 空画布引导 -->
     <div v-if="nodes.length === 0" class="canvas-hint">
-      <div class="canvas-hint-icon">🎨</div>
-      <div class="canvas-hint-text">右键画布添加节点开始创作</div>
+      <div class="canvas-hint-text">从左侧添加节点，开始创作</div>
       <div class="canvas-hint-keys">
         <kbd>Delete</kbd> 删除节点 &nbsp;·&nbsp;
         <kbd>滚轮</kbd> 缩放 &nbsp;·&nbsp;
-        <kbd>拖拽</kbd> 平移
+        <kbd>拖拽</kbd> 平移 &nbsp;·&nbsp;
+        <kbd>Ctrl + 拖拽</kbd> 框选
       </div>
     </div>
 
@@ -64,19 +94,80 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, markRaw, onMounted, watch, onUnmounted, computed, nextTick } from 'vue'
+import { ref, reactive, markRaw, onMounted, watch, onUnmounted, computed, nextTick, provide } from 'vue'
 import { VueFlow, useVueFlow } from '@vue-flow/core'
 import { Background } from '@vue-flow/background'
-import { Controls } from '@vue-flow/controls'
 import { MiniMap } from '@vue-flow/minimap'
 import type { Node, Edge } from '@vue-flow/core'
 import { useRoute, useRouter } from 'vue-router'
 import ContextMenu from '@/components/ContextMenu.vue'
+import type { CanvasMenuItem } from '@/utils/canvasMenu'
 import CustomNode from '@/components/CustomNode.vue'
 import AnimatedEdge from '@/components/AnimatedEdge.vue'
+import ConnectionPreview from '@/components/ConnectionPreview.vue'
+import CanvasToolbar from '@/components/CanvasToolbar.vue'
 import { useNodeStore } from '@/stores/node'
+import { useMaterialStore } from '@/stores/material'
+import { receivingNodeKey, receivingOffsetKey, receivingSurfaceKey, connectionPointerKey, connectionFrameOffset, connectionDropNode, canConnectNodes, normalizeCanvasEdges, trackConnectionPointer } from '@/utils/canvasConnection'
+import type { ConnectionSurface } from '@/utils/canvasConnection'
+import { imageConnectionKey, videoConnectionKey, handleMagnetKey, magneticHandleOffset, isImageNode } from '@/utils/canvasConnection'
+import type { HandleMagnet } from '@/utils/canvasConnection'
+import { appearingNodesKey } from '@/utils/nodeAppearance'
+import { compatibleConnection, isVideoNode } from '@/utils/canvasConnection'
 
 const nodeStore = useNodeStore()
+const materialStore = useMaterialStore()
+
+// 将旧版本画布中已经存在的素材引用节点补登记到独立素材库。
+const syncCanvasMaterials = (canvasNodes: Node[]) => {
+  for (const node of canvasNodes) {
+    if (node.type !== 'asset-ref' || !node.data?.assetUrl || !node.data?.assetName) continue
+    const assetUrl = String(node.data.assetUrl)
+    const localPath = assetUrl.startsWith('local-upload:///')
+      ? assetUrl.slice('local-upload:///'.length).replace(/\//g, '\\')
+      : undefined
+    materialStore.addMaterial({
+      type: node.data.assetType || 'image',
+      name: node.data.assetName,
+      url: assetUrl,
+      localPath,
+      width: node.data.assetWidth,
+      height: node.data.assetHeight,
+    })
+  }
+}
+const router = useRouter()
+const canvasRef = ref<HTMLElement>()
+const selectionMode = ref(false)
+const showMiniMap = ref(false)
+const showEdges = ref(true)
+const appearingNodes = ref(new Set<string>())
+let appearanceReady = false
+onMounted(async () => {
+  await nextTick()
+  appearanceReady = true
+})
+const appearanceTimers = new Map<string, ReturnType<typeof setTimeout>>()
+provide(appearingNodesKey, appearingNodes)
+const stopAppearanceTracking = nodeStore.$onAction(({ name, args, after }) => {
+  if (!appearanceReady || name !== 'addNode') return
+  const id = args[0]?.id
+  if (!id) return
+  after(() => {
+    appearingNodes.value.add(id)
+    clearTimeout(appearanceTimers.get(id))
+    appearanceTimers.set(id, setTimeout(() => {
+      appearingNodes.value.delete(id)
+      appearanceTimers.delete(id)
+    }, 1200))
+  })
+})
+onUnmounted(() => {
+  stopAppearanceTracking()
+  appearanceTimers.forEach(timer => clearTimeout(timer))
+  appearanceTimers.clear()
+  appearingNodes.value.clear()
+})
 
 // 对齐辅助线
 const alignmentLines = ref<Array<{ id: string; type: 'horizontal' | 'vertical'; position: number }>>([])
@@ -85,15 +176,11 @@ const MAX_ALIGNMENT_DISTANCE = 15 // 最大对齐距离（像素），超过不�
 
 // 连接验证：只允许从source连接到target
 const isValidConnection = (connection: any) => {
-  // 不允许连接到自己
-  if (connection.source === connection.target) {
-    return false
-  }
-
-  // sourceHandle应该是null或undefined（默认source handle）
-  // targetHandle应该是null或undefined（默认target handle）
-  // 这样可以确保从右侧source连接到左侧target
-  return true
+  const sourceNode = nodeStore.nodes.find(node => node.id === connection.source)
+  const targetNode = nodeStore.nodes.find(node => node.id === connection.target)
+  return Boolean(connection.source && connection.target && connection.source !== connection.target &&
+    sourceNode && targetNode &&
+    compatibleConnection(sourceNode, targetNode))
 }
 
 // 节点拖动时检测对齐
@@ -205,7 +292,20 @@ let savedViewport: { x: number; y: number; zoom: number } | null = null
 const nodes = ref<Node[]>([])
 const edges = ref<Edge[]>([])
 
-const { project, onConnect, setNodes, setEdges, viewport, getSelectedNodes } = useVueFlow({
+const {
+  screenToFlowCoordinate,
+  zoomTo,
+  fitView,
+  setCenter,
+  onConnect,
+  setNodes,
+  setEdges,
+  viewport,
+  getSelectedNodes,
+  addSelectedNodes,
+  removeSelectedNodes,
+  onSelectionEnd,
+} = useVueFlow({
   nodeTypes: {
     'ai-image': markRaw(CustomNode),
     'ai-video': markRaw(CustomNode),
@@ -239,10 +339,20 @@ const overlayStyle = computed(() => {
 // 否则 store 内部修改 node.data 时数组引用不变，VueFlow 不会重渲染 CustomNode
 watch(() => nodeStore.nodes, (newNodes) => {
   nodes.value = [...newNodes]
+  syncCanvasMaterials(newNodes as Node[])
 }, { deep: true, immediate: true })
 
-watch(() => nodeStore.edges, (newEdges) => {
-  edges.value = newEdges
+let edgeSyncVersion = 0
+watch(() => nodeStore.edges, async (newEdges) => {
+  const version = ++edgeSyncVersion
+  const pendingEdges = [...newEdges]
+
+  // 项目加载和初始化时 nodes / edges 会在同一批次写入。Vue Flow 偶尔先处理
+  // edge，节点 lookup 尚未建立就会丢弃该边，表现为“数据还在但连线看不见”。
+  // 等节点完成一帧注册后再同步边，并用版本号避免快速更新时写回旧快照。
+  await nextTick()
+  if (version !== edgeSyncVersion) return
+  edges.value = normalizeCanvasEdges(pendingEdges, nodes.value)
 }, { deep: true, immediate: true })
 
 // 同步本地nodes的位置变化回nodeStore
@@ -255,22 +365,230 @@ watch(nodes, (newNodes) => {
   })
 }, { deep: true })
 
+const copyableNodeTypes = new Set(['ai-image', 'ai-video', 'asset-ref'])
+
+const isCopyableNode = (node: Node) => {
+  if (!copyableNodeTypes.has(node.type || '')) return false
+  if (node.type !== 'asset-ref') return true
+  const assetType = (node.data as any)?.assetType
+  return assetType === 'image' || assetType === 'video'
+}
+
+// 框选可能暂时包含其他类型节点；结束时只保留图片/视频相关节点。
+onSelectionEnd(() => {
+  nodes.value.forEach((node) => {
+    if (node.selected && !isCopyableNode(node)) node.selected = false
+  })
+})
+
+interface NodeClipboard {
+  nodes: Node[]
+  edges: Edge[]
+}
+
+let nodeClipboard: NodeClipboard | null = null
+let pasteOffset = 0
+
+const cloneData = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T
+
+const selectedCopyableNodes = () => nodes.value.filter((node) => node.selected && isCopyableNode(node))
+
+const copySelectedNodes = (fallbackNode?: Node) => {
+  const selected = selectedCopyableNodes()
+  const sourceNodes = selected.length > 0
+    ? selected
+    : (fallbackNode && isCopyableNode(fallbackNode) ? [fallbackNode] : [])
+  if (sourceNodes.length === 0) return false
+
+  const selectedIds = new Set(sourceNodes.map((node) => node.id))
+  nodeClipboard = {
+    nodes: sourceNodes.map((node) => ({
+      ...cloneData(node),
+      selected: false,
+      position: { ...node.position },
+    })),
+    edges: nodeStore.edges
+      .filter((edge) => selectedIds.has(edge.source) && selectedIds.has(edge.target))
+      .map((edge) => cloneData(edge)),
+  }
+  pasteOffset = 0
+  return true
+}
+
+const pasteCopiedNodes = (at?: { clientX: number; clientY: number }) => {
+  if (!nodeClipboard || nodeClipboard.nodes.length === 0) return false
+
+  const idMap = new Map<string, string>()
+  const stamp = Date.now()
+  const offset = 45 + (pasteOffset % 6) * 15
+  const anchor = at ? screenToFlowCoordinate({ x: at.clientX, y: at.clientY }) : null
+  const offsetX = anchor ? anchor.x - Math.min(...nodeClipboard.nodes.map(node => node.position.x)) : offset
+  const offsetY = anchor ? anchor.y - Math.min(...nodeClipboard.nodes.map(node => node.position.y)) : offset
+  pasteOffset += 1
+  const pastedNodes = nodeClipboard.nodes.map((node, index) => {
+    const newId = `${node.id}-copy-${stamp}-${index}`
+    idMap.set(node.id, newId)
+    return {
+      ...cloneData(node),
+      id: newId,
+      draggable: true,
+      selectable: true,
+      selected: true,
+      position: { x: node.position.x + offsetX, y: node.position.y + offsetY },
+    } as Node
+  })
+  const pastedEdges = nodeClipboard.edges
+    .filter((edge) => idMap.has(edge.source) && idMap.has(edge.target))
+    .map((edge, index) => ({
+      ...cloneData(edge),
+      id: `e${stamp}-${index}-${idMap.get(edge.source)}-${idMap.get(edge.target)}`,
+      source: idMap.get(edge.source)!,
+      target: idMap.get(edge.target)!,
+    }))
+
+  // 粘贴后让新组成为当前选择，旧节点取消选中。
+  nodes.value.forEach((node) => { node.selected = false })
+  pastedNodes.forEach((node) => nodeStore.addNode(node))
+  pastedEdges.forEach((edge) => nodeStore.addEdge(edge))
+  nextTick(() => {
+    const pastedIds = new Set(pastedNodes.map((node) => node.id))
+    nodes.value.forEach((node) => {
+      node.selected = pastedIds.has(node.id)
+      if (pastedIds.has(node.id)) node.draggable = true
+    })
+    // 同步 Vue Flow 内部的选择集合，确保拖动一组粘贴节点时能移动整组。
+    removeSelectedNodes(nodes.value)
+    addSelectedNodes(nodes.value.filter((node) => pastedIds.has(node.id)))
+    nodeStore.selectNode(pastedNodes[0]?.id || null)
+  })
+  return true
+}
+
 // 监听连线创建（拖拽手柄）
 onConnect((connection) => {
+  if (connectionCancelled) return
+  addCanvasEdge(connection.source, connection.target)
+})
+
+/**
+ * Add a canvas connection once. Vue Flow normally calls this from a target
+ * handle, while the body-drop fallback below uses the same path so both
+ * connection gestures persist identical edges.
+ */
+const addCanvasEdge = (source: string, target: string) => {
+  if (!canConnectNodes(source, target, nodeStore.nodes, nodeStore.edges)) return
+
   const edge: Edge = {
-    id: `e${connection.source}-${connection.target}`,
-    source: connection.source,
-    target: connection.target,
+    id: `e${source}-${target}`,
+    source,
+    target,
     type: 'animated',
   }
   nodeStore.addEdge(edge)
-})
+}
 
 // 监听连线开始拖拽（显示节点选择菜单）
-const { onConnectStart, onConnectEnd } = useVueFlow()
+const { onConnectStart, onConnectEnd, endConnection } = useVueFlow()
 const connectingFrom = ref<{ nodeId: string; handleType: string } | null>(null)
+const imageConnection = computed(() => {
+  if (connectingFrom.value?.handleType !== 'source') return false
+  const source = nodeStore.nodes.find(n => n.id === connectingFrom.value?.nodeId)
+  return isImageNode(source)
+})
+provide(imageConnectionKey, imageConnection)
+const videoConnection = computed(() => {
+  if (connectingFrom.value?.handleType !== 'source') return false
+  const source = nodeStore.nodes.find(n => n.id === connectingFrom.value?.nodeId)
+  return isVideoNode(source)
+})
+provide(videoConnectionKey, videoConnection)
+const handleMagnet = ref<HandleMagnet | null>(null)
+provide(handleMagnetKey, handleMagnet)
+const resetHandleMagnet = () => { handleMagnet.value = null }
+const updateHandleMagnet = (event: MouseEvent) => {
+  if (connectingFrom.value || event.buttons) { resetHandleMagnet(); return }
+  const flow = (event.target as Element | null)?.closest?.('.vue-flow')
+  if (!flow) { resetHandleMagnet(); return }
+  let nearest: HandleMagnet | null = null
+  let nearestDistance = 48
+  flow.querySelectorAll<HTMLElement>('.custom-handle').forEach(handle => {
+    const rect = handle.getBoundingClientRect()
+    const side = handle.classList.contains('source') ? 'source' : 'target'
+    const dx = event.clientX - (rect.left + rect.width / 2 + (side === 'source' ? 22 : -22))
+    const dy = event.clientY - (rect.top + rect.height / 2)
+    const distance = Math.hypot(dx, dy)
+    const offset = magneticHandleOffset(dx, dy)
+    const nodeId = handle.closest('.vue-flow__node')?.getAttribute('data-id')
+    if (offset && nodeId && distance < nearestDistance) {
+      nearestDistance = distance
+      nearest = { nodeId, side, ...offset }
+    }
+  })
+  handleMagnet.value = nearest
+}
+const stopHandleMagnetTracking = trackConnectionPointer(updateHandleMagnet)
+document.documentElement.addEventListener('pointerleave', resetHandleMagnet)
+watch(viewport, resetHandleMagnet, { deep: true })
+let connectionCancelled = false
+const receivingNodeId = ref<string | null>(null)
+const receivingOffset = ref({ x: 0, y: 0 })
+const receivingSurface = ref<ConnectionSurface | null>(null)
+provide(receivingSurfaceKey, receivingSurface)
+const connectionPointer = ref<{ x: number; y: number } | null>(null)
+provide(connectionPointerKey, connectionPointer)
+provide(receivingNodeKey, receivingNodeId)
+provide(receivingOffsetKey, receivingOffset)
+const clearConnectionFeedback = () => {
+  receivingSurface.value = null
+  connectionPointer.value = null
+  receivingNodeId.value = null
+  receivingOffset.value = { x: 0, y: 0 }
+  connectingFrom.value = null
+}
+const dropCandidateAt = (x: number, y: number) => {
+  const from = connectingFrom.value
+  if (!from || from.handleType !== 'source') return null
+  const target = connectionDropNode(document.elementFromPoint(x, y))
+  const targetNode = target ? nodeStore.nodes.find(node => node.id === target) : null
+  if (videoConnection.value && isImageNode(targetNode)) return null
+  return target && canConnectNodes(from.nodeId, target, nodeStore.nodes, nodeStore.edges) ? target : null
+}
+const updateConnectionFeedback = (event: MouseEvent) => {
+  if (!connectingFrom.value) return
+  connectionPointer.value = { x: event.clientX, y: event.clientY }
+  const candidate = dropCandidateAt(event.clientX, event.clientY)
+  receivingNodeId.value = candidate
+  if (!candidate) {
+    receivingSurface.value = null
+    receivingOffset.value = { x: 0, y: 0 }
+    return
+  }
+  const nodeElement = document.querySelector<HTMLElement>(`.vue-flow__node[data-id="${CSS.escape(candidate)}"]`)
+  const rect = nodeElement?.querySelector('.node-surface')?.getBoundingClientRect()
+  if (!rect) {
+    receivingSurface.value = null
+    return
+  }
+  receivingSurface.value = { left: rect.left, top: rect.top, width: rect.width, height: rect.height }
+  receivingOffset.value = connectionFrameOffset(event.clientX, event.clientY, rect, viewport.value.zoom)
+}
+const cancelCanvasConnection = () => {
+  if (!connectingFrom.value) return
+  connectionCancelled = true
+  clearConnectionFeedback()
+  endConnection()
+}
+const stopConnectionPointerTracking = trackConnectionPointer(updateConnectionFeedback)
+window.addEventListener('pointercancel', cancelCanvasConnection)
 
 onConnectStart((params) => {
+  resetHandleMagnet()
+  receivingSurface.value = null
+  connectionPointer.value = params.event instanceof MouseEvent
+    ? { x: params.event.clientX, y: params.event.clientY } : null
+  connectionCancelled = false
+  receivingNodeId.value = null
+  receivingOffset.value = { x: 0, y: 0 }
   if (params.nodeId && params.handleType) {
     connectingFrom.value = {
       nodeId: params.nodeId,
@@ -280,9 +598,18 @@ onConnectStart((params) => {
 })
 
 onConnectEnd((event) => {
-  // 如果没有连接到目标节点，显示创建节点菜单
+  // 放到节点主体上也视为连接到该节点，不再要求精确命中左侧 target 手柄。
+  // 真正的 handle 命中会先触发 onConnect，这里跳过以免重复创建边。
   if (connectingFrom.value && event instanceof MouseEvent) {
     const targetElement = event.target as HTMLElement
+    const droppedNodeId = dropCandidateAt(event.clientX, event.clientY)
+    if (droppedNodeId) {
+      addCanvasEdge(connectingFrom.value.nodeId, droppedNodeId)
+      clearConnectionFeedback()
+      return
+    }
+
+    // 如果没有连接到目标节点，显示创建节点菜单
     // 检查是否点击到了空白画布
     if (targetElement.classList.contains('vue-flow__pane') ||
         targetElement.classList.contains('vue-flow__background')) {
@@ -290,11 +617,11 @@ onConnectEnd((event) => {
       contextMenu.x = event.clientX
       contextMenu.y = event.clientY
       contextMenu.items = [
-        { label: '添加AI绘图节点', icon: '🎨', action: 'add-ai-image' },
-        { label: '添加AI视频节点', icon: '🎬', action: 'add-ai-video' },
-        { label: '添加AI文本节点', icon: '💬', action: 'add-ai-text' },
-        { label: '添加资产引用节点', icon: '📦', action: 'add-asset-ref' },
-        { label: '添加后处理节点', icon: '⚡', action: 'add-post-process' },
+        { label: '图片', icon: 'image', action: 'add-ai-image' },
+        { label: '视频', icon: 'video', action: 'add-ai-video' },
+        { label: '文本', icon: 'text', action: 'add-ai-text' },
+        { label: '素材引用', icon: 'assets', action: 'add-asset-ref' },
+        { label: '后处理', icon: 'effects', action: 'add-post-process' },
       ]
       contextMenu.data = {
         clientX: event.clientX,
@@ -303,20 +630,52 @@ onConnectEnd((event) => {
       }
     }
   }
-  connectingFrom.value = null
+  clearConnectionFeedback()
 })
 
-// 键盘删除监听 — 必须在 onMounted 最前面注册，否则 early return 会跳过
+const isTextEditingTarget = (target: EventTarget | null) => {
+  const element = target as HTMLElement | null
+  if (!element) return false
+  return element.tagName === 'INPUT' ||
+    element.tagName === 'TEXTAREA' ||
+    element.isContentEditable ||
+    Boolean(element.closest('[contenteditable="true"]')) ||
+    Boolean(element.closest('.generator-input'))
+}
+
+// Vue Flow 1.33 对字符串 selectionKeyCode 的运行时声明有误，会把
+// "Control" 当成非法 prop。直接追踪 Ctrl 状态：按住时关闭平移并启用框选，
+// 松开后恢复左键平移，行为仍然是 Ctrl + 鼠标左键拖拽框选。
+const ctrlPressed = ref(false)
+
+// 键盘删除、复制、粘贴监听 — 必须在 onMounted 最前面注册，否则 early return 会跳过
 const handleKeyDown = (event: KeyboardEvent) => {
+  if (event.key === 'Escape' && connectingFrom.value) {
+    cancelCanvasConnection()
+    return
+  }
+  if (event.key === 'Control') ctrlPressed.value = true
+  if (isTextEditingTarget(event.target)) return
+  if (event.key === 'Escape' && contextMenu.visible) {
+    contextMenu.visible = false
+    return
+  }
+
+  const modifier = event.ctrlKey || event.metaKey
+  if (modifier && event.key.toLowerCase() === 'd') {
+    if (copySelectedNodes()) { event.preventDefault(); pasteCopiedNodes() }
+    return
+  }
+  if (modifier && event.key.toLowerCase() === 'c') {
+    if (copySelectedNodes()) event.preventDefault()
+    return
+  }
+  if (modifier && event.key.toLowerCase() === 'v') {
+    if (pasteCopiedNodes()) event.preventDefault()
+    return
+  }
+
   if (event.key === 'Delete') {
-    const target = event.target as HTMLElement
-    if (target.tagName === 'INPUT' ||
-        target.tagName === 'TEXTAREA' ||
-        target.isContentEditable ||
-        target.closest('[contenteditable="true"]') ||
-        target.closest('.generator-input')) {
-      return
-    }
     const sel = getSelectedNodes.value
     if (sel.length > 0) {
       sel.forEach(n => nodeStore.removeNode(n.id))
@@ -326,10 +685,27 @@ const handleKeyDown = (event: KeyboardEvent) => {
     event.preventDefault()
   }
 }
+const handleKeyUp = (event: KeyboardEvent) => {
+  if (event.key === 'Control') ctrlPressed.value = false
+}
+const handleWindowBlur = () => {
+  resetHandleMagnet()
+  cancelCanvasConnection()
+  ctrlPressed.value = false
+}
 window.addEventListener('keydown', handleKeyDown)
+window.addEventListener('keyup', handleKeyUp)
+window.addEventListener('blur', handleWindowBlur)
 onUnmounted(() => {
+  stopHandleMagnetTracking()
+  document.documentElement.removeEventListener('pointerleave', resetHandleMagnet)
+  clearConnectionFeedback()
+  stopConnectionPointerTracking()
+  window.removeEventListener('pointercancel', cancelCanvasConnection)
   savedViewport = { x: viewport.value.x, y: viewport.value.y, zoom: viewport.value.zoom }
   window.removeEventListener('keydown', handleKeyDown)
+  window.removeEventListener('keyup', handleKeyUp)
+  window.removeEventListener('blur', handleWindowBlur)
 })
 
 // 初始化示例节点
@@ -417,7 +793,7 @@ interface ContextMenuState {
   visible: boolean
   x: number
   y: number
-  items: Array<{ label: string; icon: string; action: string }>
+  items: CanvasMenuItem[]
   data?: any
 }
 
@@ -437,12 +813,14 @@ const onPaneContextMenu = (event: MouseEvent) => {
   contextMenu.x = event.clientX
   contextMenu.y = event.clientY
   contextMenu.items = [
-    { label: '添加AI绘图节点', icon: '🎨', action: 'add-ai-image' },
-    { label: '添加AI视频节点', icon: '🎬', action: 'add-ai-video' },
-        { label: '添加AI文本节点', icon: '💬', action: 'add-ai-text' },
-    { label: '添加资产引用节点', icon: '📦', action: 'add-asset-ref' },
-    { label: '添加后处理节点', icon: '⚡', action: 'add-post-process' },
-    { label: '上传素材', icon: '📤', action: 'upload-asset' },
+    { label: '新建节点', action: 'create-menu', children: [
+      { label: '图片', icon: 'image', action: 'add-ai-image' },
+      { label: '视频', icon: 'video', action: 'add-ai-video' },
+      { label: '素材引用', icon: 'assets', action: 'add-asset-ref' },
+      { label: '素材库', icon: 'assets', action: 'assets', separatorBefore: true },
+      { label: '本地上传', icon: 'upload', action: 'upload-asset' },
+    ] },
+    { label: '粘贴', action: 'paste', shortcut: 'Ctrl+V', separatorBefore: true, disabled: !nodeClipboard?.nodes.length },
   ]
   contextMenu.data = { clientX: event.clientX, clientY: event.clientY }
 }
@@ -450,6 +828,7 @@ const onPaneContextMenu = (event: MouseEvent) => {
 // 处理原生右键事件（备用）
 const handleContextMenu = (event: MouseEvent) => {
   const target = event.target as HTMLElement
+  if (target.closest('.vue-flow__node')) return
   // 只处理画布背景的右键，不处理节点
   if (target.classList.contains('vue-flow__pane') ||
       target.classList.contains('vue-flow__background') ||
@@ -462,15 +841,23 @@ const handleContextMenu = (event: MouseEvent) => {
 // 节点右键菜单
 const onNodeContextMenu = (event: { event: MouseEvent; node: Node }) => {
   event.event.preventDefault()
+  event.event.stopPropagation()
+  if (!nodes.value.find(node => node.id === event.node.id)?.selected) {
+    removeSelectedNodes(getSelectedNodes.value)
+    addSelectedNodes([event.node.id])
+  }
+  nodeStore.selectNode(event.node.id)
 
   contextMenu.visible = true
   contextMenu.x = event.event.clientX
   contextMenu.y = event.event.clientY
   contextMenu.items = [
-    { label: '执行生成', icon: '▶️', action: 'execute' },
-    { label: '编辑参数', icon: '📝', action: 'edit' },
-    { label: '复制', icon: '📋', action: 'copy' },
-    { label: '删除', icon: '🗑️', action: 'delete' },
+    { label: '复制', action: 'copy', shortcut: 'Ctrl+C', disabled: !isCopyableNode(event.node) },
+    { label: '复制副本', action: 'duplicate', shortcut: 'Ctrl+D', disabled: !isCopyableNode(event.node) },
+    { label: '粘贴', action: 'paste', shortcut: 'Ctrl+V', disabled: !nodeClipboard?.nodes.length },
+    { label: '编辑参数', action: 'edit', separatorBefore: true, disabled: event.node.type === 'asset-ref' },
+    { label: '执行生成', action: 'execute', disabled: event.node.type === 'asset-ref' || event.node.data?.status === 'running' },
+    { label: '删除', action: 'delete', shortcut: 'Delete', separatorBefore: true },
   ]
   contextMenu.data = event.node
 }
@@ -479,6 +866,12 @@ const onNodeContextMenu = (event: { event: MouseEvent; node: Node }) => {
 const onContextMenuSelect = (action: string) => {
   if (action === 'upload-asset') {
     handleUploadAsset()
+  } else if (action === 'upload-audio') {
+    handleUploadAsset('audio')
+  } else if (action === 'timeline' || action === 'assets') {
+    router.push(action === 'timeline' ? '/editor' : '/assets')
+  } else if (action === 'paste') {
+    pasteCopiedNodes({ clientX: contextMenu.x, clientY: contextMenu.y })
   } else if (action.startsWith('add-')) {
     addNodeByType(action.replace('add-', ''))
   } else {
@@ -487,73 +880,177 @@ const onContextMenuSelect = (action: string) => {
   contextMenu.visible = false
 }
 
-// 处理上传素材（通过右键菜单）
-const handleUploadAsset = () => {
-  const input = document.createElement('input')
-  input.type = 'file'
-  input.accept = 'image/*,video/*,audio/*'
-  input.multiple = true
+type CanvasAssetType = 'image' | 'video' | 'audio'
 
-  input.onchange = async (e: Event) => {
-    const files = (e.target as HTMLInputElement).files
-    if (!files || files.length === 0) return
+const inferCanvasAssetType = (file: File): CanvasAssetType | null => {
+  const mime = file.type.toLowerCase()
+  if (mime.startsWith('image/')) return 'image'
+  if (mime.startsWith('video/')) return 'video'
+  if (mime.startsWith('audio/')) return 'audio'
 
-    for (const file of Array.from(files)) {
-      // 判断文件类型
-      let type: 'image' | 'video' | 'audio' = 'image'
-      if (file.type.startsWith('video/')) type = 'video'
-      else if (file.type.startsWith('audio/')) type = 'audio'
+  const extension = file.name.toLowerCase().split('.').pop() || ''
+  if (['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'avif', 'tif', 'tiff'].includes(extension)) return 'image'
+  if (['mp4', 'mov', 'webm', 'mkv', 'avi', 'm4v'].includes(extension)) return 'video'
+  if (['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus'].includes(extension)) return 'audio'
+  return null
+}
 
-      // 先读成 data URL 确保即时显示，同时落盘持久化
-      const dataUrl = await new Promise<string>((resolve) => {
-        const reader = new FileReader()
-        reader.onload = () => resolve(reader.result as string)
-        reader.readAsDataURL(file)
-      })
+const readFileAsDataUrl = (file: File) => new Promise<string>((resolve, reject) => {
+  const reader = new FileReader()
+  reader.onload = () => resolve(reader.result as string)
+  reader.onerror = () => reject(reader.error)
+  reader.readAsDataURL(file)
+})
 
-      let assetUrl: string = dataUrl
-      // 落盘：data URL → 磁盘文件 → local-upload:/// URL，重启不丢
+/** Read dimensions from the original file before it is persisted under local-upload://. */
+const readMediaDimensions = (url: string, type: CanvasAssetType) => new Promise<{ width: number; height: number } | undefined>((resolve) => {
+  if (type === 'audio') return resolve(undefined)
+
+  let settled = false
+  let timer: number | undefined
+  let cleanup = () => {}
+  const finish = (dimensions?: { width: number; height: number }) => {
+    if (settled) return
+    settled = true
+    if (timer !== undefined) window.clearTimeout(timer)
+    cleanup()
+    resolve(dimensions)
+  }
+  timer = window.setTimeout(() => finish(), 8000)
+
+  if (type === 'image') {
+    const image = new Image()
+    cleanup = () => {
+      image.onload = null
+      image.onerror = null
+      image.removeAttribute('src')
+    }
+    image.onload = () => finish(image.naturalWidth && image.naturalHeight
+      ? { width: image.naturalWidth, height: image.naturalHeight } : undefined)
+    image.onerror = () => finish()
+    image.src = url
+    return
+  }
+
+  const video = document.createElement('video')
+  cleanup = () => {
+    video.onloadedmetadata = null
+    video.onerror = null
+    video.removeAttribute('src')
+    video.load()
+  }
+  video.preload = 'metadata'
+  video.onloadedmetadata = () => finish(video.videoWidth && video.videoHeight
+    ? { width: video.videoWidth, height: video.videoHeight } : undefined)
+  video.onerror = () => finish()
+  video.src = url
+  video.load()
+})
+
+const addFilesToCanvas = async (files: File[], clientX: number, clientY: number) => {
+  const supportedFiles = files.filter((file) => inferCanvasAssetType(file))
+  if (supportedFiles.length === 0) return
+
+  const basePosition = screenToFlowCoordinate({
+    x: clientX || window.innerWidth / 2,
+    y: clientY || window.innerHeight / 2,
+  })
+
+  for (const [index, file] of supportedFiles.entries()) {
+    const type = inferCanvasAssetType(file)
+    if (!type) continue
+
+    try {
+      const dataUrl = await readFileAsDataUrl(file)
+      const dimensions = await readMediaDimensions(dataUrl, type)
+      let assetUrl = dataUrl
+      let localPath: string | undefined
       const base64 = dataUrl.includes('base64,') ? dataUrl.split('base64,')[1] : dataUrl
+
+      // 本地文件落盘后用自定义协议引用，重启软件后素材仍然可用。
       if (window.electronAPI?.upload?.save) {
         try {
           const savedPath = await window.electronAPI.upload.save(base64, file.name)
           if (savedPath) {
-            // C:\...\file.png → local-upload:///C:/.../file.png
+            localPath = savedPath
             assetUrl = 'local-upload:///' + savedPath.replace(/\\/g, '/')
           }
-        } catch { /* 落盘失败回退 data URL */ }
+        } catch { /* 落盘失败时保留 data URL，保证本次拖入仍可用 */ }
       }
 
-      const position = project({
-        x: contextMenu.data?.clientX || window.innerWidth / 2,
-        y: contextMenu.data?.clientY || window.innerHeight / 2,
+      // 用户导入的素材进入独立素材库；生成结果仍由 assetStore 负责。
+      materialStore.addMaterial({
+        type,
+        name: file.name,
+        url: assetUrl,
+        localPath,
+        width: dimensions?.width,
+        height: dimensions?.height,
       })
 
-      const node: Node = {
+      const column = index % 4
+      const row = Math.floor(index / 4)
+      nodeStore.addNode({
         id: `asset-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
         type: 'asset-ref',
-        position,
+        position: {
+          x: basePosition.x + column * 45,
+          y: basePosition.y + row * 45,
+        },
         data: {
           label: file.name,
           assetType: type,
           assetUrl,
           assetName: file.name,
+          assetWidth: dimensions?.width,
+          assetHeight: dimensions?.height,
         },
-      }
-
-      nodeStore.addNode(node)
+      })
+    } catch (error) {
+      console.warn('[canvas-drop] failed to import file:', file.name, error)
     }
+  }
+}
+
+const onCanvasDragOver = (event: DragEvent) => {
+  if (event.dataTransfer?.types.includes('Files')) {
+    event.dataTransfer.dropEffect = 'copy'
+  }
+}
+
+const onCanvasDrop = (event: DragEvent) => {
+  const files = event.dataTransfer?.files
+  if (!files || files.length === 0) return
+  contextMenu.visible = false
+  void addFilesToCanvas(Array.from(files), event.clientX, event.clientY)
+}
+
+// 处理上传素材（通过右键菜单）
+const handleUploadAsset = (type?: 'audio', position = contextMenu.data) => {
+  const input = document.createElement('input')
+  input.type = 'file'
+  input.accept = type === 'audio' ? 'audio/*' : 'image/*,video/*,audio/*'
+  input.multiple = true
+
+  input.onchange = async (e: Event) => {
+    const files = (e.target as HTMLInputElement).files
+    if (!files || files.length === 0) return
+    await addFilesToCanvas(
+      Array.from(files),
+      position?.clientX ?? window.innerWidth / 2,
+      position?.clientY ?? window.innerHeight / 2,
+    )
   }
 
   input.click()
 }
 
 // 添加节点
-const addNodeByType = (type: string) => {
-  const { clientX, clientY, connectFrom } = contextMenu.data
-  const position = project({ x: clientX, y: clientY })
+const addNodeByType = (type: string, placement = contextMenu.data) => {
+  const { clientX, clientY, connectFrom } = placement
+  const position = screenToFlowCoordinate({ x: clientX, y: clientY })
 
-  const nodeId = `node_${Date.now()}`
+  const nodeId = `node_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
   const newNode: Node = {
     id: nodeId,
     type: type,
@@ -581,8 +1078,39 @@ const addNodeByType = (type: string) => {
       target: connectFrom.handleType === 'source' ? nodeId : connectFrom.nodeId,
       type: 'animated',
     }
-    nodeStore.addEdge(edge)
+    addCanvasEdge(edge.source, edge.target)
   }
+  return nodeId
+}
+
+// 工具栏的新节点放在当前可视区域，独立于上一次右键菜单的坐标。
+const toolbarPlacement = () => {
+  const rect = canvasRef.value!.getBoundingClientRect()
+  const clientX = rect.left + rect.width / 2 - 175 * viewport.value.zoom
+  const clientY = rect.top + rect.height / 2 - 100 * viewport.value.zoom
+  const candidate = screenToFlowCoordinate({ x: clientX, y: clientY })
+  let offset = 0
+  while (nodes.value.some(node => Math.abs(node.position.x - candidate.x - offset) < 30 && Math.abs(node.position.y - candidate.y - offset) < 30) && offset < 225) offset += 45
+  return { clientX: clientX + offset * viewport.value.zoom, clientY: clientY + offset * viewport.value.zoom }
+}
+const addFromToolbar = async (type: string) => {
+  const id = addNodeByType(type, toolbarPlacement())
+  await nextTick()
+  removeSelectedNodes(getSelectedNodes.value)
+  addSelectedNodes([id])
+  nodeStore.selectNode(id)
+}
+const uploadFromToolbar = (type?: 'audio') => handleUploadAsset(type, toolbarPlacement())
+const fitCanvas = () => {
+  if (nodes.value.length) void fitView({ padding: { left: '90px', right: '40px', top: '80px', bottom: '80px' }, maxZoom: 1, duration: 220 })
+}
+const focusCanvasNode = (id: string) => {
+  const node = nodes.value.find(node => node.id === id)
+  if (!node) return
+  removeSelectedNodes(getSelectedNodes.value)
+  addSelectedNodes([id])
+  nodeStore.selectNode(id)
+  void setCenter(node.position.x + (node.dimensions?.width || 350) / 2, node.position.y + (node.dimensions?.height || 220) / 2, { zoom: Math.max(viewport.value.zoom, 0.75), duration: 220 })
 }
 
 // 节点点击
@@ -603,8 +1131,10 @@ const handleNodeAction = (action: string) => {
       // 展开节点底部的生成卡片
       break
     case 'copy':
-      // TODO: 实现复制功能
-      console.log('复制节点:', node)
+      copySelectedNodes(node)
+      break
+    case 'duplicate':
+      if (copySelectedNodes(node)) pasteCopiedNodes()
       break
     case 'delete':
       nodeStore.removeNode(node.id)
@@ -628,13 +1158,24 @@ const getNodeLabel = (type: string): string => {
 .node-editor {
   width: 100%;
   height: 100%;
-  background: #020308;
+  background: radial-gradient(circle at 52% 42%, rgba(44, 53, 68, 0.16), transparent 42%), linear-gradient(180deg, #111214 0%, #0d0e10 100%);
   position: relative;
 }
 
 .vue-flow-container {
   width: 100%;
   height: 100%;
+}
+
+/* Keep the pointer-following line under opaque node surfaces, including their
+   temporary 3D transform. Its interior segment must never paint on the card. */
+:deep(.vue-flow__connectionline) {
+  z-index: 1;
+  pointer-events: none;
+}
+
+:deep(.vue-flow__nodes) {
+  z-index: 2;
 }
 
 /* 对齐辅助线 overlay：跟随 vue-flow viewport 一起 transform */
@@ -652,50 +1193,67 @@ const getNodeLabel = (type: string): string => {
   width: 200000px;
   height: 0;
   left: -100000px;
-  border-top: 1px dashed rgba(0, 217, 255, 0.8);
+  border-top: 1px dashed rgba(214, 220, 228, 0.46);
 }
 
 .alignment-line.vertical {
   width: 0;
   height: 200000px;
   top: -100000px;
-  border-left: 1px dashed rgba(0, 217, 255, 0.8);
+  border-left: 1px dashed rgba(214, 220, 228, 0.46);
 }
 
 :deep(.vue-flow__background) {
-  background-color: #020308;
+  background-color: #0d0e10;
+  opacity: 0.88;
 }
 
 :deep(.vue-flow__minimap) {
-  background-color: rgba(2, 3, 8, 0.9);
-  border: 1px solid #00D9FF;
+  left: 12px;
+  bottom: 60px;
+  margin: 0;
+  background-color: rgba(25, 27, 31, 0.94);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
+}
+
+.edges-hidden :deep(.vue-flow__edges), .edges-hidden :deep(.vue-flow__edge-labels) {
+  visibility: hidden;
+  pointer-events: none;
 }
 
 :deep(.vue-flow__controls) {
-  border: 1px solid #00D9FF;
-  background: rgba(2, 3, 8, 0.9);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  overflow: hidden;
+  background: rgba(25, 27, 31, 0.94);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
 }
 
 :deep(.vue-flow__controls button) {
-  background: rgba(0, 217, 255, 0.1);
-  border-bottom: 1px solid #00D9FF;
-  color: #00D9FF;
+  background: transparent;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.64);
+  transition: background 0.15s ease, color 0.15s ease;
 }
 
 :deep(.vue-flow__controls button:hover) {
-  background: rgba(0, 217, 255, 0.2);
+  background: rgba(255, 255, 255, 0.08);
+  color: #ffffff;
+}
+
+:deep(.vue-flow__controls button svg) {
+  fill: currentColor;
 }
 
 /* 框选矩形 */
-:deep(.vue-flow__selection) {
-  background: rgba(0, 217, 255, 0.08);
-  border: 1px solid rgba(0, 217, 255, 0.5);
-}
-
-/* 被选中的节点高亮 */
-:deep(.vue-flow__node.selected) > .custom-node .node-main {
-  border-color: #00D9FF !important;
-  box-shadow: 0 0 12px rgba(0, 217, 255, 0.4), inset 0 0 0 2px #00D9FF !important;
+:deep(.vue-flow__selection),
+:deep(.vue-flow__nodesselection-rect) {
+  background: rgba(214, 220, 228, 0.08);
+  border: 1px solid rgba(214, 220, 228, 0.42);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04);
+  border-radius: 2px;
 }
 
 /* 空画布引导 */
@@ -714,10 +1272,10 @@ const getNodeLabel = (type: string): string => {
   display: inline-block;
   padding: 1px 6px;
   font-size: 11px;
-  border: 1px solid rgba(0,217,255,0.3);
+  border: 1px solid rgba(255,255,255,0.16);
   border-radius: 3px;
-  color: #00D9FF;
-  background: rgba(0,217,255,0.08);
+  color: rgba(255,255,255,0.72);
+  background: rgba(255,255,255,0.06);
   font-family: inherit;
 }
 </style>

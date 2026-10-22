@@ -1,7 +1,7 @@
 {
   "name": "ai-video-canvas",
-  "version": "0.3.0",
-  "description": "AI Video Creation Canvas - Desktop application for AI-powered video creation workflow",
+  "version": "0.3.18",
+  "description": "芜湖AI - 图片与视频生成画布",
   "main": "electron/main.cjs",
   "type": "module",
   "scripts": {
@@ -17,10 +17,10 @@
   },
   "build": {
     "appId": "com.sanshiman.aivideo-canvas",
-    "productName": "AI Video Canvas",
+    "productName": "芜湖AI",
     "publish": {
       "provider": "github",
-      "owner": "sancedoknore-create",
+      "owner": "z372949862-bot",
       "repo": "huabu"
     },
     "directories": {
@@ -64,13 +64,13 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "AI Video Canvas",
+      "shortcutName": "芜湖AI",
       "perMachine": false,
       "deleteAppDataOnUninstall": false,
-      "artifactName": "AI-Video-Canvas-${version}-Setup.${ext}"
+      "artifactName": "${productName}-${version}-Setup.${ext}"
     },
     "portable": {
-      "artifactName": "AI-Video-Canvas-${version}-portable.exe"
+      "artifactName": "${productName}-${version}-portable.exe"
     }
   },
   "keywords": [
@@ -83,7 +83,7 @@
   "author": "",
   "repository": {
     "type": "git",
-    "url": "https://github.com/sancedoknore-create/huabu"
+    "url": "https://github.com/z372949862-bot/huabu"
   },
   "license": "MIT",
   "dependencies": {
